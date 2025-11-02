@@ -1,0 +1,315 @@
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { google } from 'googleapis';
+import { z } from 'zod';
+import Handlebars from 'handlebars';
+import { GmailSendRequestSchema, GmailSendResponseSchema, GmailAuthError, GmailSendError, DEFAULT_REPORT_TEMPLATE, } from './gmail-types.js';
+import { logger } from '../utils/logger.js';
+import { retryNetworkOperation } from '../utils/retry.js';
+export class GmailMCPServer {
+    server;
+    config;
+    gmail = null;
+    auth = null;
+    constructor(config) {
+        this.config = config;
+        this.server = new McpServer({
+            name: 'mcp-gmail-server',
+            version: '1.0.0',
+        });
+        this.setupTools();
+    }
+    setupTools() {
+        // Registrar la herramienta para enviar emails
+        this.server.registerTool('gmail_send', {
+            title: 'Enviar Email con Gmail',
+            description: 'Envía un email a través de Gmail API con soporte para múltiples destinatarios y adjuntos',
+            inputSchema: GmailSendRequestSchema,
+            outputSchema: GmailSendResponseSchema,
+        }, async (params) => {
+            return await this.sendEmail(params);
+        });
+        // Herramienta para enviar reportes con plantilla predefinida
+        this.server.registerTool('gmail_send_report', {
+            title: 'Enviar Reporte por Email',
+            description: 'Envía un reporte formateado con KPIs y datos usando plantilla HTML',
+            inputSchema: z.object({
+                to: z.array(z.string().email()).min(1),
+                cc: z.array(z.string().email()).optional(),
+                reportType: z.string().min(1),
+                date: z.string(),
+                period: z.string(),
+                kpis: z.array(z.object({
+                    label: z.string(),
+                    value: z.string(),
+                })),
+                tableHeaders: z.array(z.string()).optional(),
+                tableData: z.array(z.array(z.any())).optional(),
+                csvContent: z.string().optional(),
+                hasData: z.boolean().default(true),
+            }),
+            outputSchema: GmailSendResponseSchema,
+        }, async (params) => {
+            return await this.sendReport(params);
+        });
+        // Herramienta para verificar autenticación
+        this.server.registerTool('gmail_auth_status', {
+            title: 'Verificar Estado de Autenticación Gmail',
+            description: 'Verifica si las credenciales de Gmail están configuradas correctamente',
+            inputSchema: z.object({}),
+            outputSchema: z.object({
+                authenticated: z.boolean(),
+                email: z.string().optional(),
+                message: z.string(),
+            }),
+        }, async () => {
+            return await this.checkAuthStatus();
+        });
+    }
+    async sendEmail(request) {
+        try {
+            await this.ensureAuthenticated();
+            const { to, cc, bcc, subject, body_text, body_html, attachments = [] } = request;
+            logger.info('Sending email via Gmail API', {
+                to: to.length,
+                cc: cc?.length || 0,
+                bcc: bcc?.length || 0,
+                subject,
+                attachments: attachments.length
+            });
+            // Construir el mensaje de email
+            const emailContent = this.buildEmailContent({
+                to,
+                cc,
+                bcc,
+                subject,
+                body_text,
+                body_html,
+                attachments,
+            });
+            // Enviar el email con reintentos
+            const result = await retryNetworkOperation(async () => {
+                return await this.gmail.users.messages.send({
+                    userId: this.config.impersonateEmail,
+                    requestBody: {
+                        raw: emailContent,
+                    },
+                });
+            });
+            const response = {
+                status: 'sent',
+                message_id: result.data.id,
+                recipients_count: to.length + (cc?.length || 0) + (bcc?.length || 0),
+                sent_at: new Date().toISOString(),
+            };
+            logger.info('Email sent successfully', {
+                messageId: response.message_id,
+                recipientsCount: response.recipients_count,
+            });
+            return {
+                content: [
+                    {
+                        type: 'text',
+                        text: JSON.stringify(response, null, 2),
+                    },
+                ],
+                structuredContent: response,
+            };
+        }
+        catch (error) {
+            logger.error('Failed to send email', { error, request });
+            const response = {
+                status: 'failed',
+                error: error instanceof Error ? error.message : 'Unknown error',
+                recipients_count: request.to.length + (request.cc?.length || 0) + (request.bcc?.length || 0),
+                sent_at: new Date().toISOString(),
+            };
+            if (error instanceof Error) {
+                throw new GmailSendError(error.message, request.to, error);
+            }
+            throw new GmailSendError('Unknown error occurred', request.to);
+        }
+    }
+    async sendReport(params) {
+        try {
+            // Compilar plantillas con Handlebars
+            const subjectTemplate = Handlebars.compile(DEFAULT_REPORT_TEMPLATE.subject);
+            const htmlTemplate = Handlebars.compile(DEFAULT_REPORT_TEMPLATE.htmlTemplate);
+            const textTemplate = Handlebars.compile(DEFAULT_REPORT_TEMPLATE.textTemplate || '');
+            const templateData = {
+                reportType: params.reportType,
+                date: params.date,
+                period: params.period,
+                kpis: params.kpis,
+                tableHeaders: params.tableHeaders,
+                tableData: params.tableData,
+                hasData: params.hasData ?? true,
+            };
+            const subject = subjectTemplate(templateData);
+            const body_html = htmlTemplate(templateData);
+            const body_text = textTemplate(templateData);
+            // Preparar adjuntos
+            const attachments = [];
+            if (params.csvContent) {
+                const csvBase64 = Buffer.from(params.csvContent, 'utf-8').toString('base64');
+                attachments.push({
+                    filename: `reporte_${params.reportType.toLowerCase().replace(/\s+/g, '_')}_${params.date}.csv`,
+                    content_base64: csvBase64,
+                    mimeType: 'text/csv',
+                });
+            }
+            // Enviar el email usando la función base
+            return await this.sendEmail({
+                to: params.to,
+                cc: params.cc,
+                subject,
+                body_html,
+                body_text,
+                attachments,
+            });
+        }
+        catch (error) {
+            logger.error('Failed to send report email', { error, params });
+            throw error;
+        }
+    }
+    async checkAuthStatus() {
+        try {
+            await this.ensureAuthenticated();
+            // Obtener información del perfil para confirmar autenticación
+            const profile = await this.gmail.users.getProfile({
+                userId: this.config.impersonateEmail,
+            });
+            const result = {
+                authenticated: true,
+                email: profile.data.emailAddress,
+                message: 'Gmail API authentication successful',
+            };
+            return {
+                content: [
+                    {
+                        type: 'text',
+                        text: JSON.stringify(result, null, 2),
+                    },
+                ],
+                structuredContent: result,
+            };
+        }
+        catch (error) {
+            logger.error('Gmail authentication check failed', { error });
+            const result = {
+                authenticated: false,
+                message: `Authentication failed: ${error instanceof Error ? error.message : 'Unknown error'}`,
+            };
+            return {
+                content: [
+                    {
+                        type: 'text',
+                        text: JSON.stringify(result, null, 2),
+                    },
+                ],
+                structuredContent: result,
+            };
+        }
+    }
+    buildEmailContent(params) {
+        const boundary = `----=_NextPart_${Date.now()}_${Math.random().toString(36)}`;
+        let email = '';
+        // Headers del email
+        email += `From: ${this.config.impersonateEmail}\r\n`;
+        email += `To: ${params.to.join(', ')}\r\n`;
+        if (params.cc && params.cc.length > 0) {
+            email += `Cc: ${params.cc.join(', ')}\r\n`;
+        }
+        if (params.bcc && params.bcc.length > 0) {
+            email += `Bcc: ${params.bcc.join(', ')}\r\n`;
+        }
+        email += `Subject: ${params.subject}\r\n`;
+        email += `MIME-Version: 1.0\r\n`;
+        email += `Content-Type: multipart/mixed; boundary="${boundary}"\r\n\r\n`;
+        // Cuerpo del mensaje
+        if (params.body_text && params.body_html) {
+            const altBoundary = `----=_Alt_${Date.now()}_${Math.random().toString(36)}`;
+            email += `--${boundary}\r\n`;
+            email += `Content-Type: multipart/alternative; boundary="${altBoundary}"\r\n\r\n`;
+            // Texto plano
+            email += `--${altBoundary}\r\n`;
+            email += `Content-Type: text/plain; charset=utf-8\r\n\r\n`;
+            email += `${params.body_text}\r\n\r\n`;
+            // HTML
+            email += `--${altBoundary}\r\n`;
+            email += `Content-Type: text/html; charset=utf-8\r\n\r\n`;
+            email += `${params.body_html}\r\n\r\n`;
+            email += `--${altBoundary}--\r\n`;
+        }
+        else if (params.body_html) {
+            email += `--${boundary}\r\n`;
+            email += `Content-Type: text/html; charset=utf-8\r\n\r\n`;
+            email += `${params.body_html}\r\n\r\n`;
+        }
+        else if (params.body_text) {
+            email += `--${boundary}\r\n`;
+            email += `Content-Type: text/plain; charset=utf-8\r\n\r\n`;
+            email += `${params.body_text}\r\n\r\n`;
+        }
+        // Adjuntos
+        if (params.attachments && params.attachments.length > 0) {
+            for (const attachment of params.attachments) {
+                email += `--${boundary}\r\n`;
+                email += `Content-Type: ${attachment.mimeType}; name="${attachment.filename}"\r\n`;
+                email += `Content-Disposition: attachment; filename="${attachment.filename}"\r\n`;
+                email += `Content-Transfer-Encoding: base64\r\n\r\n`;
+                email += `${attachment.content_base64}\r\n\r\n`;
+            }
+        }
+        email += `--${boundary}--\r\n`;
+        // Codificar en base64 para Gmail API
+        return Buffer.from(email)
+            .toString('base64')
+            .replace(/\+/g, '-')
+            .replace(/\//g, '_')
+            .replace(/=+$/, '');
+    }
+    async ensureAuthenticated() {
+        if (!this.gmail) {
+            await this.authenticate();
+        }
+    }
+    async authenticate() {
+        try {
+            // Configurar autenticación con Service Account
+            this.auth = new google.auth.JWT({
+                email: this.config.serviceAccountEmail,
+                key: this.config.serviceAccountPrivateKey,
+                scopes: [
+                    'https://www.googleapis.com/auth/gmail.send',
+                    'https://www.googleapis.com/auth/gmail.readonly',
+                ],
+                subject: this.config.impersonateEmail, // Importante: impersonar el usuario
+            });
+            // Inicializar Gmail API
+            this.gmail = google.gmail({
+                version: 'v1',
+                auth: this.auth,
+            });
+            // Verificar autenticación obteniendo el perfil
+            await this.gmail.users.getProfile({
+                userId: this.config.impersonateEmail,
+            });
+            logger.info('Gmail API authentication successful', {
+                serviceAccount: this.config.serviceAccountEmail,
+                impersonating: this.config.impersonateEmail,
+            });
+        }
+        catch (error) {
+            logger.error('Gmail API authentication failed', { error });
+            throw new GmailAuthError(`Cannot authenticate with Gmail API: ${error instanceof Error ? error.message : 'Unknown error'}`, error instanceof Error ? error : undefined);
+        }
+    }
+    getMCPServer() {
+        return this.server;
+    }
+    async handleRequest(transport) {
+        await this.server.connect(transport);
+    }
+}
+//# sourceMappingURL=gmail-server.js.map

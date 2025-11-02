@@ -1,0 +1,7 @@
+{"level":"info","message":"Cron jobs configured","schedule":"0 9 * * *","service":"agent-reportes","timestamp":"2025-11-02T20:49:18.289Z","timezone":"America/Mexico_City"}
+{"error":{"code":"ECONNREFUSED","message":""},"level":"error","message":"Failed to create MySQL connection pool","service":"agent-reportes","timestamp":"2025-11-02T20:49:18.332Z"}
+{"level":"info","message":"Cron jobs configured","schedule":"0 9 * * *","service":"agent-reportes","timestamp":"2025-11-02T20:50:13.536Z","timezone":"America/Mexico_City"}
+{"error":{"code":"ECONNREFUSED","message":""},"level":"error","message":"Failed to create MySQL connection pool","service":"agent-reportes","timestamp":"2025-11-02T20:50:13.572Z"}
+{"error":"","level":"info","message":"⚠️  WARNING: MySQL not available. Backend will start but database features will not work.","service":"agent-reportes","timestamp":"2025-11-02T20:50:13.573Z"}
+{"impersonating":"sundai-latam@sundai-latam.iam.gserviceaccount.com","level":"info","message":"Gmail API authentication successful","service":"agent-reportes","serviceAccount":"sundai-latam@sundai-latam.iam.gserviceaccount.com","timestamp":"2025-11-02T20:50:13.574Z"}
+{"cronEnabled":true,"host":"localhost","level":"info","message":"Report Agent started","port":3000,"service":"agent-reportes","timestamp":"2025-11-02T20:50:13.581Z"}

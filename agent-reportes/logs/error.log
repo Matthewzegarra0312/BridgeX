@@ -1,0 +1,2 @@
+{"error":{"code":"ECONNREFUSED","message":""},"level":"error","message":"Failed to create MySQL connection pool","service":"agent-reportes","timestamp":"2025-11-02T20:49:18.332Z"}
+{"error":{"code":"ECONNREFUSED","message":""},"level":"error","message":"Failed to create MySQL connection pool","service":"agent-reportes","timestamp":"2025-11-02T20:50:13.572Z"}
